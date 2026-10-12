@@ -170,17 +170,25 @@ class TestAdd:
         assert (tmp_path / ".agentchanti.yaml").read_text(
             encoding="utf-8") == COMMENTED
 
-    def test_user_scope_is_rejected_with_the_reason(self, tmp_path, capsys,
-                                                    monkeypatch):
-        """Silently omitting the flag would hide the limitation; rejecting
-        it states it. `_find_config_file` returns the FIRST match and never
-        merges, so a home-scoped server is dead in any project with a file."""
-        monkeypatch.chdir(tmp_path)
+    def test_user_scope_writes_the_home_config_not_the_project(
+            self, isolated_home, tmp_path, capsys, monkeypatch):
+        """This assertion used to be that `--scope user` was REFUSED, which
+        it was until the `mcp:` section learned to merge across the user and
+        project files. Kept rather than deleted, pointed at the behaviour
+        that replaced it: the home config is written and the project's is
+        not touched. See tests/test_mcp_cli_scope.py for the merge itself.
+        """
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        monkeypatch.chdir(proj)
         code, out = _run(["add", "x", "--scope", "user", "--read-only",
                           "python", "s.py"], capsys)
-        assert code == 2
-        assert "NEVER merged" in out
-        assert not (tmp_path / ".agentchanti.yaml").exists()
+        assert code == 0
+        # `~` is redirected per test by tests/conftest.py, so this cannot
+        # reach the developer's own config — which is how it got there once.
+        home = isolated_home / ".agentchanti.yaml"
+        assert home.exists() and str(home) in out
+        assert not (proj / ".agentchanti.yaml").exists()
 
     def test_an_http_server_keeps_its_url_and_headers(
             self, tmp_path, capsys, monkeypatch):

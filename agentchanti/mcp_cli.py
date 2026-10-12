@@ -63,7 +63,13 @@ _MISSING_COSTS = {
 # temperament, where declining beats half-doing it.
 
 _TOP_LEVEL_MCP = re.compile(r"^mcp:\s*(?:#.*)?$")
-_SERVERS_KEY = re.compile(r"^(\s+)servers:\s*(?:#.*)?$")
+# `servers:` with no value, or with an explicitly EMPTY flow list. The
+# second spelling is one this module writes itself: removing the last
+# server rewrites the key to `servers: []` so the config still loads, and
+# without matching it here `add` could never put a server back — measured,
+# `remove` followed by `add` refused with "no plain `servers:` key".
+_SERVERS_KEY = re.compile(r"^(\s+)servers:\s*(?:\[\s*\])?\s*(?:#.*)?$")
+_SERVERS_EMPTY_LIST = re.compile(r"^(\s+)servers:\s*\[\s*\]\s*(?:#.*)?$")
 
 
 def _server_block(entry: dict, indent: str) -> str:
@@ -96,41 +102,27 @@ def _insert_server(text: str, entry: dict) -> tuple[str | None, str]:
                    f"{newline}mcp:{newline}  servers:{newline}")
         return text + section + block, "appended a new `mcp:` section"
 
-    # Find `servers:` inside the mcp block — i.e. before the next line that
-    # starts at column 0 and is neither blank nor a comment.
-    end = len(lines)
-    for i in range(mcp_at + 1, len(lines)):
-        stripped = lines[i].rstrip("\r\n")
-        if stripped and not stripped[0].isspace() and not stripped.startswith("#"):
-            end = i
-            break
-
-    servers_at = servers_indent = None
-    for i in range(mcp_at + 1, end):
-        m = _SERVERS_KEY.match(lines[i].rstrip("\r\n"))
-        if m:
-            servers_at, servers_indent = i, m.group(1)
-            break
-    if servers_at is None:
+    # One scanner, shared with `_remove_server`: insertion and deletion
+    # disagreeing about a file's shape is the class of defect this module
+    # exists to avoid, and two copies of an indentation walk is exactly how
+    # that happens.
+    found = _servers_list(lines)
+    if found is None:
         return None, ("`mcp:` exists but has no plain `servers:` key — it may "
                       "be a list or inline mapping, and inserting into one "
                       "blindly could corrupt it")
+    servers_at, item_indent, items = found
+    last_item_line = items[-1][1] if items else servers_at
 
-    # The list items, and where the list stops.
-    item_indent = None
-    last_item_line = servers_at
-    for i in range(servers_at + 1, end):
-        raw = lines[i].rstrip("\r\n")
-        if not raw.strip() or raw.lstrip().startswith("#"):
-            continue
-        lead = raw[:len(raw) - len(raw.lstrip())]
-        if len(lead) <= len(servers_indent):
-            break                      # back out to a sibling key of servers
-        if raw.lstrip().startswith("- ") and item_indent is None:
-            item_indent = lead
-        last_item_line = i
-    if item_indent is None:
-        item_indent = servers_indent + "  "
+    # An explicitly empty list has to become a key with items under it, or
+    # the result is `servers: []` followed by orphaned `- name:` lines.
+    empty = _SERVERS_EMPTY_LIST.match(lines[servers_at].rstrip("\r\n"))
+    if empty:
+        raw = lines[servers_at]
+        eol = raw[len(raw.rstrip("\r\n")):] or newline
+        lines[servers_at] = f"{empty.group(1)}servers:{eol}"
+        item_indent = empty.group(1) + "  "
+        last_item_line = servers_at
 
     block = _server_block(entry, item_indent)
     if not lines[last_item_line].endswith(("\n", "\r")):
@@ -186,14 +178,22 @@ def _servers_list(lines: list[str]) -> tuple[int, str, list[tuple[int, int]]] | 
         if not raw.strip() or raw.lstrip().startswith("#"):
             continue
         lead = raw[:len(raw) - len(raw.lstrip())]
-        if len(lead) <= len(servers_indent):
-            break
-        if raw.lstrip().startswith("- "):
+        is_dash = raw.lstrip().startswith("- ")
+        # A sequence under a key may be indented deeper than the key OR sit
+        # at the same column — PyYAML's own default dump does the latter,
+        # and both are valid YAML. Requiring the first spelling made the
+        # scanner blind to every file another tool had written; measured as
+        # `no server named 'x' in this file` over a file plainly declaring
+        # it. So a dash at or past the key's indent is an item, and only a
+        # NON-dash line at or before it ends the list.
+        if is_dash and len(lead) >= len(servers_indent):
             if item_indent is None:
                 item_indent = lead
             if len(lead) == len(item_indent):
                 items.append((i, i))
                 continue
+        if not is_dash and len(lead) <= len(servers_indent):
+            break
         if items:
             items[-1] = (items[-1][0], i)
     if item_indent is None:
@@ -388,6 +388,9 @@ def _cmd_list(args) -> int:
             print(f"  {spec.name}{status}")
             print(f"      {spec.transport}: {_describe_target(spec)}")
             print(f"      {_fence(spec)}")
+            if spec.source and os.path.abspath(spec.source) != os.path.abspath(
+                    path or ""):
+                print(f"      from {spec.source} (--scope user)")
             missing = [k for k in _MISSING_COSTS if not getattr(spec, k, None)]
             for key in missing:
                 print(f"      no {key} — {_MISSING_COSTS[key]}")
@@ -421,6 +424,8 @@ def _cmd_get(args) -> int:
     spec = match[0]
 
     print(f"\n{spec.name}\n")
+    if spec.source:
+        print(f"  declared in  {spec.source}")
     print(f"  transport    {spec.transport}")
     print(f"  {'command' if spec.transport == 'stdio' else 'url':<12} "
           f"{_describe_target(spec)}")
@@ -504,16 +509,22 @@ def _discover(entry: dict) -> tuple[list[str], str]:
         mcp_bridge.stop_active()
 
 
-def _write_entry(args, entry: dict, path: str | None) -> int:
+def _write_entry(args, entry: dict, _path: str | None) -> int:
     """Insert *entry*, verify it parses, and report. Returns an exit code."""
+    target, why = _target_for_scope(getattr(args, "scope", "project"), _path)
+    if target is None:
+        print(f"\n  {why}.\n")
+        return 2
+
     specs, _problems, _cfg, _p = _load(args.config)
-    if any(s.name == entry["name"] for s in specs):
+    clash = next((s for s in specs if s.name == entry["name"]), None)
+    if clash is not None:
+        where = clash.source or _p or "the config"
         print(f"\n  A server named {entry['name']!r} is already configured in "
-              f"{path}.\n  Edit it there, or choose another name — names "
+              f"{where}.\n  Edit it there, or choose another name — names "
               f"qualify tool names and must be unique.\n")
         return 1
 
-    target = path or os.path.join(os.getcwd(), ".agentchanti.yaml")
     text = ""
     if os.path.isfile(target):
         with open(target, "r", encoding="utf-8", newline="") as fh:
@@ -545,14 +556,30 @@ def _write_entry(args, entry: dict, path: str | None) -> int:
     return 0
 
 
+def _target_for_scope(scope: str, path: str | None) -> tuple[str | None, str]:
+    """(file to edit, error). `user` writes the home config, `project` the
+    one in the working directory — never whichever happened to be found."""
+    from .config import home_config_file
+    if scope == "user":
+        home = os.path.expanduser("~")
+        if os.path.abspath(home) == os.path.abspath(os.getcwd()):
+            return None, ("the working directory IS your home directory, so "
+                          "`user` and `project` are the same file — use "
+                          "--scope project")
+        return (home_config_file()
+                or os.path.join(home, ".agentchanti.yaml")), ""
+    if scope == "project":
+        # Deliberately not `path`: that may be the HOME file, which
+        # `_find_config_file` returns when the project has none. Writing a
+        # "project" server into the user config would be the opposite of
+        # what was asked.
+        return os.path.join(os.getcwd(), ".agentchanti.yaml"), ""
+    return None, (f"unknown scope {scope!r} — use `project` or `user` "
+                  f"(`local` has no equivalent here: agentchanti has no "
+                  f"per-project private store, only the file itself)")
+
+
 def _cmd_add(args) -> int:
-    if args.scope != "project":
-        print(f"\n  --scope {args.scope} is not supported yet. "
-              f"`.agentchanti.yaml` is found CWD-first and NEVER merged, so "
-              f"a server written to a home config is silently ignored in "
-              f"every project that has its own file — which is every project "
-              f"that sets a provider. Use --scope project (the default).\n")
-        return 2
     try:
         env = _kv(args.env, "=", "--env")
         headers = _kv(args.header, ":", "--header")
@@ -638,10 +665,6 @@ def _cmd_add_json(args) -> int:
     document instead of three more flags.
     """
     import json
-    if args.scope != "project":
-        print(f"\n  --scope {args.scope} is not supported yet; see "
-              f"`agentchanti mcp add --help`.\n")
-        return 2
     try:
         entry = json.loads(args.json)
     except ValueError as exc:
@@ -658,13 +681,23 @@ def _cmd_add_json(args) -> int:
 
 
 def _cmd_remove(args) -> int:
-    if args.scope != "project":
-        print(f"\n  --scope {args.scope} is not supported yet; see "
-              f"`agentchanti mcp add --help`.\n")
+    specs, _problems, _cfg, found = _load(args.config)
+    # The file the server actually came from, when the merge knows it:
+    # asking someone to remember which scope they added it under is a
+    # question the tool can answer itself. An explicit --scope overrides.
+    known = next((s.source for s in specs
+                  if s.name == args.name and s.source), None)
+    if args.config:
+        path, why = args.config, ""
+    elif args.scope is None and known:
+        path, why = known, ""
+    else:
+        path, why = _target_for_scope(args.scope or "project", found)
+    if path is None:
+        print(f"\n  {why}.\n")
         return 2
-    _specs, _problems, _cfg, path = _load(args.config)
-    if not path or not os.path.isfile(path):
-        print("\n  No .agentchanti.yaml to edit.\n")
+    if not os.path.isfile(path):
+        print(f"\n  No config file at {path} to edit.\n")
         return 1
     with open(path, "r", encoding="utf-8", newline="") as fh:
         text = fh.read()
@@ -677,18 +710,32 @@ def _cmd_remove(args) -> int:
         fh.write(updated)
     print(f"\n  {args.name}: {note} ({path}).")
 
-    # Re-read through the pipeline's own loader, exactly as `add` does: the
-    # question is not whether the text changed but whether what is left is
-    # a config the run will accept.
-    specs, problems, _cfg, _p = _load(path)
+    # Two different questions, and reading one file answered only the
+    # first. Measured: removing a user-scoped server reported
+    # `Remaining: none` while the project still declared one, because the
+    # verification re-read the edited file instead of the effective config.
+    #
+    #   did the edit take?   -> that FILE must no longer declare the name
+    #   what is left?        -> the MERGED config, which is what a run sees
+    edited, problems, _cfg, _p = _load(path)
     for p in problems:
         print(f"  ! {p}")
-    if any(s.name == args.name for s in specs):
-        print(f"  ! it is still being loaded — the removal did not take.\n")
+    if any(s.name == args.name for s in edited):
+        print("  ! it is still declared there — the removal did not take.\n")
         return 1
-    remaining = ", ".join(s.name for s in specs) or "none"
-    print(f"  Remaining: {remaining}\n")
-    return 1 if problems else 0
+
+    effective, eff_problems, _cfg, _p = _load(args.config)
+    remaining = ", ".join(f"{s.name}{' (user)' if s.source and path and
+                          os.path.abspath(s.source) != os.path.abspath(path)
+                          else ''}" for s in effective) or "none"
+    print(f"  Remaining: {remaining}")
+    still = next((s for s in effective if s.name == args.name), None)
+    if still is not None:
+        print(f"  ! {args.name!r} is still configured in "
+              f"{still.source or 'another config'} — remove it there too if "
+              f"that is not what you want.")
+    print()
+    return 1 if problems or eff_problems else 0
 
 
 def mcp_main(argv: list[str] | None = None) -> int:
@@ -760,7 +807,13 @@ def mcp_main(argv: list[str] | None = None) -> int:
 
     p_rm = sub.add_parser("remove", help="Remove a server from the config")
     p_rm.add_argument("name")
-    p_rm.add_argument("-s", "--scope", default="project")
+    # Default None rather than "project": argparse cannot distinguish a
+    # default from an explicit value, and the sensible default here is "the
+    # file the server actually came from", which is only knowable at run
+    # time. An explicit --scope still overrides it.
+    p_rm.add_argument("-s", "--scope", default=None,
+                      help="Which config to edit (project | user); by "
+                           "default, the one the server came from")
     p_rm.set_defaults(func=_cmd_remove)
 
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])

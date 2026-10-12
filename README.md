@@ -527,10 +527,23 @@ ambiguous (flow-style `servers: [...]`, or `mcp:` written as a bare list),
 printing the block for you to paste instead. The result is then verified by
 re-reading the file through the same loader the pipeline uses.
 
-`--scope` currently accepts `project` only. A home-level server would be
-**silently ignored** in any project with its own `.agentchanti.yaml`,
-because the config is found CWD-first and never merged; the flag says so
-rather than failing quietly.
+`-s/--scope` is `project` (the default) or `user`:
+
+```bash
+agentchanti mcp add shared --scope user --read-only -- python shared.py
+```
+
+A `user` server lives in `~/.agentchanti.yaml` and is offered in **every**
+project. This is the one section of the config that merges across the two
+files — everything else stays first-file-wins, where a provider resolved
+half from one file and half from another would be worse than one source.
+Project entries take precedence on a name collision, and the duplicate is
+reported rather than silently dropped. `mcp list` marks where each server
+came from, and `remove` edits the file the server actually came from unless
+you name a scope.
+
+There is no `local` scope: agentchanti has no per-project private store,
+only the file itself.
 
 ---
 

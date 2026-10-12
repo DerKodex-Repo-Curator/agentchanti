@@ -166,6 +166,12 @@ class MCPServerSpec:
     # without this the one check that ends a run stuck on an unsatisfiable
     # gate is silent by construction. See orchestrator/external_state.py.
     state_probe: str = ""
+    # Which `.agentchanti.yaml` this entry came from. Set by `Config.load`
+    # when the user and project configs are merged, and empty otherwise.
+    # Carried so `mcp list` can name the file responsible for a server: a
+    # merged view that cannot say where an entry came from is a mystery,
+    # and removing that mystery is what this command set is for.
+    source: str = ""
 
     def problem(self) -> str | None:
         """Why this spec cannot be used, or None."""
@@ -217,6 +223,7 @@ def load_specs(raw: Any) -> tuple[list[MCPServerSpec], list[str]]:
         return specs, [f"mcp config should be a list or mapping of servers, "
                        f"got {type(entries).__name__}"]
     seen: set[str] = set()
+    seen_source: dict[str, str] = {}
     for entry in entries:
         if not isinstance(entry, dict):
             problems.append(f"mcp server entry is not a mapping: {entry!r}")
@@ -237,6 +244,7 @@ def load_specs(raw: Any) -> tuple[list[MCPServerSpec], list[str]]:
                 snapshot={str(k): str(v) for k, v in
                           (entry.get("snapshot") or {}).items()},
                 state_probe=str(entry.get("state_probe") or "").strip(),
+                source=str(entry.get("_source") or ""),
             )
         except (TypeError, ValueError) as exc:
             problems.append(f"mcp server entry {entry!r} is malformed: {exc}")
@@ -246,10 +254,21 @@ def load_specs(raw: Any) -> tuple[list[MCPServerSpec], list[str]]:
             problems.append(problem)
             continue
         if spec.name in seen:
-            problems.append(f"duplicate mcp server name {spec.name!r} — "
-                            f"names qualify tool names and must be unique")
+            # The FIRST wins, and `Config.load` puts the project's entries
+            # first — so when the user and project configs are merged this
+            # is a project server shadowing a user one, which is the right
+            # precedence and still worth saying out loud. Naming both files
+            # is the difference between a puzzle and an explanation.
+            where = (f" — the project's entry wins; the one in "
+                     f"{spec.source} is ignored"
+                     if spec.source and spec.source != seen_source.get(spec.name)
+                     else "")
+            problems.append(f"duplicate mcp server name {spec.name!r}{where}"
+                            + ("" if where else " — names qualify tool names "
+                                                "and must be unique"))
             continue
         seen.add(spec.name)
+        seen_source[spec.name] = spec.source
         specs.append(spec)
     return specs, problems
 

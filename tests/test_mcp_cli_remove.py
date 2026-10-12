@@ -156,19 +156,27 @@ class TestRemoveCommand:
         assert (tmp_path / ".agentchanti.yaml").read_text(
             encoding="utf-8") == THREE
 
-    def test_user_scope_is_rejected(self, tmp_path, capsys, monkeypatch):
-        (tmp_path / ".agentchanti.yaml").write_text(THREE, encoding="utf-8")
-        monkeypatch.chdir(tmp_path)
+    def test_an_explicit_user_scope_leaves_the_project_file_alone(
+            self, tmp_path, capsys, monkeypatch):
+        """This used to assert that `--scope user` was refused. Now it
+        selects the home config — so the project's file must be untouched
+        even though the name it asks for is declared there."""
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        (proj / ".agentchanti.yaml").write_text(THREE, encoding="utf-8")
+        monkeypatch.chdir(proj)
         code, _out = _run(["remove", "two", "--scope", "user"], capsys)
-        assert code == 2
-        assert (tmp_path / ".agentchanti.yaml").read_text(
+        assert code == 1          # nothing of that name in the home config
+        assert (proj / ".agentchanti.yaml").read_text(
             encoding="utf-8") == THREE
 
     def test_no_config_file_at_all(self, tmp_path, capsys, monkeypatch):
-        monkeypatch.chdir(tmp_path)
+        proj = tmp_path / "proj"
+        proj.mkdir()
+        monkeypatch.chdir(proj)
         code, out = _run(["remove", "two"], capsys)
         assert code == 1
-        assert "No .agentchanti.yaml" in out
+        assert "No config file" in out
 
 
 def test_add_then_remove_is_a_byte_for_byte_round_trip(tmp_path, capsys,
