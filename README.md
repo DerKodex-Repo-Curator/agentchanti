@@ -551,6 +551,8 @@ only the file itself.
 
 For full documentation including architecture details, configuration reference, library API, plugin system, and troubleshooting, see **[documentation.md](documentation.md)**.
 
+For external tools over MCP — installing the extra, adding and checking a server, the allow list, snapshots and undo — see **[docs/mcp.md](docs/mcp.md)**.
+
 ---
 
 ## Contributing
