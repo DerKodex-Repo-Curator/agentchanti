@@ -202,4 +202,8 @@ def test_add_then_remove_is_a_byte_for_byte_round_trip(tmp_path, capsys,
                 capsys)[0] == 0
     assert _names(path.read_text(encoding="utf-8")) == ["blender", "second"]
     assert _run(["remove", "second"], capsys)[0] == 0
-    assert path.read_text(encoding="utf-8", newline="") == original
+    # `open(...)` rather than `Path.read_text(newline=...)`: that keyword
+    # is Python 3.13, this package supports 3.10, and the 3.13 used to
+    # write it is why the difference was invisible until CI.
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        assert fh.read() == original

@@ -725,9 +725,17 @@ def _cmd_remove(args) -> int:
         return 1
 
     effective, eff_problems, _cfg, _p = _load(args.config)
-    remaining = ", ".join(f"{s.name}{' (user)' if s.source and path and
-                          os.path.abspath(s.source) != os.path.abspath(path)
-                          else ''}" for s in effective) or "none"
+
+    def _label(spec) -> str:
+        # Spelled out rather than folded into the f-string: a line break
+        # inside a replacement field is PEP 701, i.e. Python 3.12+, and
+        # this package supports 3.10. It parsed on the 3.13 used to write
+        # it and could not even be imported on the version CI runs first.
+        elsewhere = (spec.source and path
+                     and os.path.abspath(spec.source) != os.path.abspath(path))
+        return f"{spec.name} (user)" if elsewhere else spec.name
+
+    remaining = ", ".join(_label(s) for s in effective) or "none"
     print(f"  Remaining: {remaining}")
     still = next((s for s in effective if s.name == args.name), None)
     if still is not None:
